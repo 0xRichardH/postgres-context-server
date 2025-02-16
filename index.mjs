@@ -18,41 +18,86 @@ const server = new Server({
   version: "0.1.0",
 });
 
-const databaseUrl = process.env.DATABASE_URL;
-if (typeof databaseUrl == null || databaseUrl.trim().length === 0) {
-  console.error("Please provide a DATABASE_URL environment variable");
-  process.exit(1);
-}
-
-const resourceBaseUrl = new URL(databaseUrl);
-resourceBaseUrl.protocol = "postgres:";
-resourceBaseUrl.password = "";
-
-process.stderr.write("starting server. url: " + databaseUrl + "\n");
-const pool = new pg.Pool({
-  connectionString: databaseUrl,
-});
-
+const DEFAULT_DATABASE_NAME = "default";
 const SCHEMA_PATH = "schema";
 const SCHEMA_PROMPT_NAME = "pg-schema";
 const ALL_TABLES = "all-tables";
 
-server.setRequestHandler(ListResourcesRequestSchema, async () => {
-  const client = await pool.connect();
-  try {
-    const result = await client.query(
-      "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",
+const getDatabaseUrls = () => {
+  // DATABASE_URL='postgresql://user:pass@host/database'
+  const databaseUrl = process.env.DATABASE_URL;
+  // DATABASE_URLS='{"db1":"postgresql://user:pass@host/database1", "db2":"postgresql://user:pass@host/database2"}'
+  let databaseUrls = process.env.DATABASE_URLS
+    ? JSON.parse(process.env.DATABASE_URLS)
+    : {};
+  if (databaseUrl && databaseUrl.trim().length > 0) {
+    databaseUrls[DEFAULT_DATABASE_NAME] = databaseUrl;
+  }
+
+  if (Object.keys(databaseUrls).length === 0) {
+    console.error(
+      "Please provide DATABASE_URLS environment variable as JSON object",
     );
-    return {
-      resources: result.rows.map((row) => ({
+    console.error(
+      'Example: {"db1":"postgresql://user:pass@host/db1", "db2":"postgresql://user:pass@host/db2"}',
+    );
+    process.exit(1);
+  }
+
+  return databaseUrls;
+};
+
+const databaseUrls = getDatabaseUrls();
+const pools = {};
+for (const [dbName, url] of Object.entries(databaseUrls)) {
+  pools[dbName] = new pg.Pool({
+    connectionString: url,
+  });
+  process.stderr.write(`Connected to database: ${dbName}\n`);
+}
+
+const cleanup = async () => {
+  for (const [dbName, pool] of Object.entries(pools)) {
+    await pool.end();
+  }
+  process.exit(0);
+};
+process.stderr.write("starting server.");
+process.on("SIGTERM", cleanup);
+process.on("SIGINT", cleanup);
+
+const getResourceBaseUrl = (dbName) => {
+  const databaseUrl = databaseUrls[dbName];
+  const resourceBaseUrl = new URL(databaseUrl);
+  resourceBaseUrl.protocol = "postgres:";
+  resourceBaseUrl.password = "";
+  return resourceBaseUrl;
+};
+
+server.setRequestHandler(ListResourcesRequestSchema, async () => {
+  const resources = [];
+
+  for (const [dbName, pool] of Object.entries(pools)) {
+    const client = await pool.connect();
+    try {
+      const result = await client.query(
+        "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",
+      );
+
+      const resourceBaseUrl = getResourceBaseUrl(dbName);
+      const dbResources = result.rows.map((row) => ({
         uri: new URL(`${row.table_name}/${SCHEMA_PATH}`, resourceBaseUrl).href,
         mimeType: "application/json",
-        name: `"${row.table_name}" database schema`,
-      })),
-    };
-  } finally {
-    client.release();
+        name: `"${dbName}.${row.table_name}" database schema`,
+      }));
+
+      resources.push(...dbResources);
+    } finally {
+      client.release();
+    }
   }
+
+  return { resources };
 });
 
 server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
@@ -60,10 +105,15 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
 
   const pathComponents = resourceUrl.pathname.split("/");
   const schema = pathComponents.pop();
+  const dbName = pathComponents.pop();
   const tableName = pathComponents.pop();
 
   if (schema !== SCHEMA_PATH) {
     throw new Error("Invalid resource URI");
+  }
+  const pool = pools[dbName || "default"];
+  if (!pool) {
+    throw new Error(`Database not found: ${dbName}`);
   }
 
   const client = await pool.connect();
@@ -101,18 +151,23 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               enum: ["all", "specific"],
               description: "Mode of schema retrieval",
             },
+            dbName: {
+              type: "string",
+              enum: Object.keys(databaseUrls),
+              description: "Name of the database to query",
+            },
             tableName: {
               type: "string",
               description:
                 "Name of the specific table (required if mode is 'specific')",
             },
           },
-          required: ["mode"],
+          required: ["mode", "dbName"],
           if: {
             properties: { mode: { const: "specific" } },
           },
           then: {
-            required: ["tableName"],
+            required: ["tableName", "dbName"],
           },
         },
       },
@@ -123,7 +178,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           type: "object",
           properties: {
             sql: { type: "string" },
+            dbName: {
+              type: "string",
+              enum: Object.keys(databaseUrls),
+              description: "Name of the database to query",
+            },
           },
+          required: ["sql", "dbName"],
         },
       },
     ],
@@ -131,6 +192,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 });
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  const dbName = request.params.arguments?.dbName || DEFAULT_DATABASE_NAME;
+  const pool = pools[dbName];
+  if (!pool) {
+    throw new Error(`Database not found: ${dbName}`);
+  }
+
   if (request.params.name === "pg-schema") {
     const tableName = request.params.arguments?.tableName;
 
@@ -194,6 +261,11 @@ server.setRequestHandler(CompleteRequestSchema, async (request) => {
       };
     }
 
+    const dbName = request.params.argument?.dbName || DEFAULT_DATABASE_NAME;
+    const pool = pools[dbName];
+    if (!pool) {
+      throw new Error(`Database not found: ${dbName}`);
+    }
     const client = await pool.connect();
     try {
       const result = await client.query(
@@ -224,6 +296,11 @@ server.setRequestHandler(ListPromptsRequestSchema, async () => {
           "Retrieve the schema for a given table in the postgres database",
         arguments: [
           {
+            name: "dbName",
+            description: "the database to query",
+            required: true,
+          },
+          {
             name: "tableName",
             description: "the table to describe",
             required: true,
@@ -238,8 +315,13 @@ server.setRequestHandler(GetPromptRequestSchema, async (request) => {
   process.stderr.write("Handling prompts/get request\n");
 
   if (request.params.name === SCHEMA_PROMPT_NAME) {
+    const dbName = request.params.arguments?.dbName || DEFAULT_DATABASE_NAME;
     const tableName = request.params.arguments?.tableName;
 
+    const pool = pools[dbName];
+    if (!pool) {
+      throw new Error(`Database not found: ${dbName}`);
+    }
     if (typeof tableName !== "string" || tableName.length === 0) {
       throw new Error(`Invalid tableName: ${tableName}`);
     }
@@ -252,8 +334,8 @@ server.setRequestHandler(GetPromptRequestSchema, async (request) => {
       return {
         description:
           tableName === ALL_TABLES
-            ? "all table schemas"
-            : `${tableName} schema`,
+            ? `all table schemas for database ${dbName}`
+            : `${tableName} schema description for database ${dbName}`,
         messages: [
           {
             role: "user",
